@@ -1,0 +1,8 @@
+# Graphify working artifacts
+*.db
+__pycache__/
+*.pyc
+graphify-out/
+.smoke_*
+smoke_lsp.py
+.graphify_learning.json

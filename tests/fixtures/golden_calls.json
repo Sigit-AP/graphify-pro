@@ -1,0 +1,10 @@
+{
+  "calls": [
+    {"from": "auth.authenticate", "to": "auth.verify_token"},
+    {"from": "auth.authenticate", "to": "db.lookup_user"},
+    {"from": "api.handle_request", "to": "auth.authenticate"},
+    {"from": "api.handle_request", "to": "db.fetch_data"},
+    {"from": "db.fetch_data", "to": "db.connect"},
+    {"from": "db.lookup_user", "to": "db.connect"}
+  ]
+}
