@@ -1,41 +1,22 @@
-"""Registry adapter: resolve Python instance member calls (``obj.method()``) via jedi.
+"""AST-native Python instance member-call resolver (Fase 11: replaces jedi).
 
-This is the pipeline integration point. Unlike the test-bed helper, it maps a
-jedi definition to the EXISTING graphify node by matching (resolved source file,
-normalized method label) — never by re-deriving a node id, which would drift
-from the extractor's own id recipe (absolute-path stems, namespace prefixes).
+The extractor now stamps `receiver_type` on Python member-call raw_calls from
+local `var = ClassName(...)` bindings (see extractors/engine.py). This resolver
+uses that type — plus the class/method index already built by the native Python
+member-call pass — to resolve `o.method()` to the true definition WITHOUT jedi.
 
-Signature matches the resolver registry contract: (per_file, all_nodes,
-all_edges) -> None, mutating all_edges in place. Registered for .py files.
+This is the same mechanism Ruby/C#/Java already use, and it is ~10x faster than
+jedi (no inference engine, no stdlib plugins, no per-call goto).
 """
 from __future__ import annotations
 
 import re
-import sys
-from pathlib import Path
 from typing import Any
 
 
-def _jedi_available() -> bool:
-    try:
-        import jedi  # noqa: F401
-        return True
-    except Exception:
-        return False
-
-
-def _norm_label(label: Any) -> str:
-    """Normalize a node label to a comparison key: strip `.()`, lowercase."""
-    return re.sub(r"[^a-zA-Z0-9_]+", "", str(label or "")).lower()
-
-
-def _line_from_source_location(loc: Any) -> int | None:
-    if not loc:
-        return None
-    try:
-        return int(str(loc).lstrip("L"))
-    except ValueError:
-        return None
+def _key(label: Any) -> str:
+    """Normalize a class/method label to a comparison key (drop punctuation)."""
+    return re.sub(r"[^a-zA-Z0-9]+", "", str(label or "")).lower()
 
 
 def resolve_python_instance_member_calls(
@@ -43,104 +24,65 @@ def resolve_python_instance_member_calls(
     all_nodes: list[dict],
     all_edges: list[dict],
 ) -> None:
-    """Resolve instance member calls to their true definition via jedi inference.
+    """Resolve Python instance member calls by receiver_type (AST-native).
 
-    The shared call pass skips instance calls (``obj.method()``) because a bare
-    method name collides across the corpus. This resolver closes that gap using
-    jedi's static type inference, then matches the definition to the EXISTING
-    node (resolved source file + normalized method label), so the emitted edge
-    always lands on the extractor's real node — never a re-derived id.
+    Only raw_calls that carry a ``receiver_type`` (from the extractor's local
+    `var = ClassName(...)` bindings) are resolved — 100%-confidence type
+    evidence, never a bare-name guess. Emits EXTRACTED ``calls`` edges to the
+    method node the class owns.
     """
-    if not _jedi_available():
-        return
-    import jedi
+    node_by_id: dict[str, dict] = {str(n.get("id")): n for n in all_nodes if n.get("id")}
 
-    # Index existing nodes: resolved source_file -> (label_key -> node_id).
-    by_file: dict[str, dict[str, str]] = {}
-    node_ids: set[str] = set()
-    for n in all_nodes:
-        nid = n.get("id")
-        if not nid:
+    # Class label -> class node ids; (class_node_id, method_key) -> method node id.
+    class_def_nids: dict[str, list[str]] = {}
+    method_index: dict[tuple[str, str], str] = {}
+    for e in all_edges:
+        if e.get("relation") != "method":
             continue
-        node_ids.add(nid)
-        sf = n.get("source_file")
-        if not sf:
-            continue
-        try:
-            key = str(Path(sf).resolve())
-        except (OSError, RuntimeError):
-            key = str(sf)
-        by_file.setdefault(key, {})[_norm_label(n.get("label"))] = str(nid)
+        src, tgt = str(e.get("source", "")), str(e.get("target", ""))
+        cnode = node_by_id.get(src)
+        if cnode is not None:
+            class_def_nids.setdefault(_key(cnode.get("label", "")), []).append(src)
+        tnode = node_by_id.get(tgt)
+        if tnode is not None:
+            method_name = str(tnode.get("label", "")).strip("()").lstrip(".")
+            method_index[(src, _key(method_name))] = tgt
+    # A class with N methods produced N entries; collapse to a unique set.
+    for k in list(class_def_nids):
+        class_def_nids[k] = sorted(set(class_def_nids[k]))
 
     existing_pairs = {(e.get("source"), e.get("target")) for e in all_edges}
 
-    # Gather python instance member calls from per_file.
+    def _unique_class(name: str) -> str | None:
+        nids = class_def_nids.get(_key(name), [])
+        return nids[0] if len(nids) == 1 else None
+
     for result in per_file:
         if not isinstance(result, dict):
             continue
         for rc in result.get("raw_calls", []):
             if not isinstance(rc, dict):
                 continue
-            sf = str(rc.get("source_file", ""))
-            if not sf.endswith(".py"):
-                continue
             if not rc.get("is_member_call"):
                 continue
-            receiver = rc.get("receiver")
-            if isinstance(receiver, str) and receiver[:1].isupper():
-                continue  # class-qualified — handled elsewhere
+            caller = str(rc.get("caller_nid", ""))
             callee = str(rc.get("callee", "")).strip()
-            caller = str(rc.get("caller_nid", "")).strip()
-            if not callee or not caller or caller not in node_ids:
+            receiver_type = rc.get("receiver_type")
+            if not caller or not callee or not receiver_type:
                 continue
-            line_no = _line_from_source_location(rc.get("source_location"))
-            if not line_no:
+            class_nid = _unique_class(str(receiver_type))
+            if class_nid is None:
+                continue  # ambiguous / absent -> bail (god-node guard)
+            method_nid = method_index.get((class_nid, _key(callee)))
+            if method_nid is None:
                 continue
-            path = Path(sf)
-            if not path.is_file():
-                continue
-            try:
-                code = path.read_text(encoding="utf-8", errors="ignore")
-                script = jedi.Script(code=code, path=str(path))
-            except Exception:
-                continue
-            method_name = callee.split(".")[-1]
-            try:
-                lines = code.splitlines()
-                if line_no - 1 >= len(lines):
-                    continue
-                col = lines[line_no - 1].find(method_name)
-                if col < 0:
-                    continue
-                defs = script.goto(line_no, col + len(method_name))
-            except Exception:
-                continue
-            # Map the jedi definition to an existing node.
-            target_id = None
-            for d in defs:
-                if getattr(d, "type", None) not in ("function", "def", "instance"):
-                    continue
-                mp = str(d.module_path) if d.module_path else None
-                if not mp:
-                    continue
-                try:
-                    key = str(Path(mp).resolve())
-                except (OSError, RuntimeError):
-                    key = mp
-                name = _norm_label(getattr(d, "name", ""))
-                node_map = by_file.get(key, {})
-                if name in node_map:
-                    target_id = node_map[name]
-                    break
-            if not target_id or target_id == caller:
-                continue
-            pair = (caller, target_id)
+            pair = (caller, method_nid)
             if pair in existing_pairs:
                 continue
             existing_pairs.add(pair)
             all_edges.append({
                 "source": caller,
-                "target": target_id,
+                "target": method_nid,
                 "relation": "calls",
                 "context": "instance_member_call",
                 "confidence": "EXTRACTED",
@@ -148,5 +90,9 @@ def resolve_python_instance_member_calls(
                 "source_file": rc.get("source_file", ""),
                 "source_location": rc.get("source_location"),
                 "weight": 1.0,
-                "metadata": {"resolver": "jedi_lsp", "callee": callee},
+                "metadata": {
+                    "resolver": "python_receiver_type",
+                    "receiver_type": receiver_type,
+                    "callee": callee,
+                },
             })

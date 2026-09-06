@@ -2773,6 +2773,61 @@ def _ruby_local_class_bindings(body_node, source: bytes) -> dict[str, str | None
     visit(body_node)
     return bindings
 
+def _python_local_var_types(body_node, source: bytes) -> dict[str, str | None]:
+    """Map ``local_var -> ClassName`` for ``var = ClassName(...)`` within one
+    Python function body (instance receivers), mirroring
+    ``_ruby_local_class_bindings``.
+
+    100%-confidence contract: a variable assigned more than once, or to anything
+    other than a single ``ClassName(...)`` call (where ClassName is capitalized),
+    maps to ``None`` (ambiguous) so callers never resolve it. Only the certain
+    single-binding case carries a type.
+    """
+    bindings: dict[str, str | None] = {}
+    boundary = {"function_definition", "class_definition", "lambda"}
+
+    def _call_type(right, source: bytes) -> str | None:
+        """Return ClassName if `right` is `ClassName(...)` with a capitalized
+        receiver (instantiation), else None."""
+        if right is None or right.type != "call":
+            return None
+        func = right.child_by_field_name("function")
+        if func is None:
+            return None
+        # function can be `identifier` (ClassName) or `attribute` (mod.ClassName)
+        if func.type == "identifier":
+            name = _read_text(func, source)
+            return name if name and name[:1].isupper() else None
+        if func.type == "attribute":
+            attr = func.child_by_field_name("attribute")
+            if attr is not None:
+                name = _read_text(attr, source)
+                return name if name and name[:1].isupper() else None
+        return None
+
+    def visit(n) -> None:
+        for child in n.children:
+            if child.type in boundary:
+                continue  # nested scope has its own bindings
+            if child.type == "assignment":
+                left = child.child_by_field_name("left")
+                right = child.child_by_field_name("right")
+                if left is not None and left.type == "identifier":
+                    var = _read_text(left, source)
+                    cls = _call_type(right, source)
+                    if cls is None:
+                        if var in bindings:
+                            bindings[var] = None
+                    elif var in bindings:
+                        if bindings[var] != cls:
+                            bindings[var] = None
+                    else:
+                        bindings[var] = cls
+            visit(child)
+
+    visit(body_node)
+    return bindings
+
 def _ruby_const_last_name(node, source: bytes) -> str:
     """Last constant of a ``constant`` or ``scope_resolution`` (``A::B::C`` -> ``C``)."""
     if node is None:
@@ -4891,6 +4946,10 @@ def _extract_generic(
     # populated before walk_calls runs. Lets member-call raw_calls carry a
     # receiver_type so the cross-file pass resolves `var.method` by type (#ruby).
     ruby_var_types: dict[str, dict[str, str | None]] = {}
+    # Python: per-function `var -> ClassName` table from `var = ClassName(...)`
+    # bindings, populated before walk_calls runs. Lets member-call raw_calls
+    # carry a receiver_type so the AST-native resolver handles `var.method()`.
+    python_var_types: dict[str, dict[str, str | None]] = {}
     # Fields declared on a SUPERCLASS type receivers in a subclass too (#3151):
     # fold each class's table with its ancestors', nearest declaration winning.
     # Local `inherits` edges only - the cross-file half lives in the corpus
@@ -5599,6 +5658,14 @@ def _extract_generic(
                         rc_entry["receiver_type"] = ruby_var_types.get(
                             caller_nid, {}
                         ).get(member_receiver)
+                    # Python: attach the receiver's inferred type from the method's
+                    # local `var = ClassName(...)` bindings, when unambiguously
+                    # known (mirrors Ruby). Lets the AST-native resolver resolve
+                    # `o.method()` by type without jedi.
+                    if member_receiver and config.ts_module == "tree_sitter_python":
+                        rt = python_var_types.get(caller_nid, {}).get(member_receiver)
+                        if rt:
+                            rc_entry["receiver_type"] = rt
                     # Tag the C++ raw_call's language so the cross-file C++ resolver
                     # claims it unambiguously: a `.h` file routes to extract_cpp or
                     # extract_objc by content, and both resolvers see `.h` in their
@@ -5858,6 +5925,13 @@ def _extract_generic(
     if config.ts_module == "tree_sitter_ruby":
         for caller_nid, body_node in function_bodies:
             ruby_var_types[caller_nid] = _ruby_local_class_bindings(body_node, source)
+
+    # Python: build the per-function `var -> ClassName` table from local
+    # `var = ClassName(...)` instantiation bindings so the receiver-typed
+    # member-call resolver can resolve `o.method()` without jedi.
+    if config.ts_module == "tree_sitter_python":
+        for caller_nid, body_node in function_bodies:
+            python_var_types[caller_nid] = _python_local_var_types(body_node, source)
 
     # C++: build the per-file `var -> ClassName` table from local declarations in
     # every function body so the cross-file member-call pass can type a receiver

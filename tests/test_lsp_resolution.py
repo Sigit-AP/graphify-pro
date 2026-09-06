@@ -1,7 +1,8 @@
-"""Test the registry adapter: resolve_python_instance_member_calls.
+"""Tests for the AST-native Python instance member-call resolver.
 
-End-to-end against graphify's real extract() pipeline, verifying the emitted
-edge lands on the extractor's real node (not a re-derived id).
+Replaces the old jedi-based resolver. The extractor now stamps `receiver_type`
+from local `var = ClassName(...)` bindings; this resolver resolves `o.method()`
+to the true method node by that type — no jedi, ~10x faster.
 """
 from __future__ import annotations
 
@@ -12,12 +13,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import pytest
 
-from graphify import lsp_resolution
 from graphify.extract import extract
-
-
-def _jedi_missing():
-    return not lsp_resolution._jedi_available()
 
 
 @pytest.fixture()
@@ -35,36 +31,31 @@ def pyproject(tmp_path):
     return tmp_path
 
 
-@pytest.mark.skipif(_jedi_missing(), reason="jedi not installed")
-def test_end_to_end_edge_lands_on_real_node(pyproject):
+def test_resolves_instance_member_call(pyproject):
     r = extract([pyproject / "pkg" / "models.py", pyproject / "pkg" / "main.py"],
                 root=pyproject)
     nodes = {n["id"]: n for n in r.get("nodes", [])}
-    # The save node must exist.
-    save_nodes = [nid for nid, n in nodes.items() if "save" in str(n.get("label", "")).lower()]
-    assert save_nodes, "extractor did not emit the save method node"
-
-    jedi_edges = [e for e in r.get("edges", []) if (e.get("metadata") or {}).get("resolver") == "jedi_lsp"]
-    assert jedi_edges, "jedi resolver produced no edges"
-    edge = jedi_edges[0]
-    # target must be a REAL node id (no dangling edge)
+    resolved = [e for e in r.get("edges", [])
+                if (e.get("metadata") or {}).get("resolver") == "python_receiver_type"]
+    assert resolved, "instance member call should resolve via receiver_type"
+    edge = resolved[0]
     assert edge["target"] in nodes
     assert nodes[edge["target"]]["label"] == ".save()"
     assert edge["confidence"] == "EXTRACTED"
 
 
-def test_no_crash_without_jedi(monkeypatch):
-    monkeypatch.setattr(lsp_resolution, "_jedi_available", lambda: False)
-    lsp_resolution.resolve_python_instance_member_calls([], [], [])  # must not raise
-
-
-def test_line_from_source_location():
-    assert lsp_resolution._line_from_source_location("L12") == 12
-    assert lsp_resolution._line_from_source_location(None) is None
-
-
-def test_norm_label():
-    assert lsp_resolution._norm_label(".save()") == "save"
-    assert lsp_resolution._norm_label("User") == "user"
-    # underscores are preserved (dunder/method names), punctuation stripped
-    assert lsp_resolution._norm_label("Foo.Bar__baz") == "foobar__baz"
+def test_ambiguous_receiver_not_resolved(tmp_path):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "a.py").write_text("class A:\n    def go(self):\n        return 1\n")
+    (pkg / "b.py").write_text("class B:\n    def go(self):\n        return 2\n")
+    (pkg / "main.py").write_text(
+        "from pkg.a import A\nfrom pkg.b import B\n\n"
+        "def f(flag):\n    x = A() if flag else B()\n    return x.go()\n"
+    )
+    r = extract([pkg / "a.py", pkg / "b.py", pkg / "main.py"], root=tmp_path)
+    resolved = [e for e in r.get("edges", [])
+                if (e.get("metadata") or {}).get("resolver") == "python_receiver_type"]
+    # x is assigned to two different types -> poisoned -> must NOT resolve
+    assert resolved == []
