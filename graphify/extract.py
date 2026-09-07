@@ -6458,19 +6458,25 @@ def extract(
             except ValueError:
                 continue
         new_id = _file_node_id(rel)
+        # PERF: path.resolve() is a filesystem syscall (lstat + realpath); the
+        # prior code called it up to 4x per path (old_id_abs, old_pref_abs, and
+        # two dict keys). Resolve once and reuse — profiled as a top-tottime
+        # cost (9.9k _joinrealpath calls). Semantically identical: resolve() is
+        # pure/path-idempotent within this loop (the same path object).
+        resolved_path = path.resolve()
         if old_id != new_id:
             id_remap[old_id] = new_id
         # Also register the absolute-resolved form of the file-level id so
         # alias/workspace import targets (resolved via .resolve()) remap to
         # canonical instead of orphaning (#1529).
-        old_id_abs = _make_id(str(path.resolve()))
+        old_id_abs = _make_id(str(resolved_path))
         if old_id_abs != new_id:
             id_remap[old_id_abs] = new_id
         old_prefs: list[tuple[str, str]] = []
         old_pref = _file_node_id(path)
         if old_pref != new_id:
             old_prefs.append((old_pref, new_id))
-        old_pref_abs = _file_node_id(path.resolve())
+        old_pref_abs = _file_node_id(resolved_path)
         if old_pref_abs != new_id and old_pref_abs != old_pref:
             old_prefs.append((old_pref_abs, new_id))
         # Bash entrypoint node ids append "__entry" to the file-level id
@@ -6489,10 +6495,10 @@ def extract(
             if _entry_old != _entry_new:
                 id_remap.setdefault(_entry_old, _entry_new)
         if old_prefs:
-            prefix_remap[path.resolve()] = old_prefs
+            prefix_remap[resolved_path] = old_prefs
         # Absolute form first: it is the longest, so prefix decomposition can
         # try forms in order without a shorter form shadowing it.
-        stem_forms[path.resolve()] = (
+        stem_forms[resolved_path] = (
             new_id, [old_pref_abs, old_pref, new_id]
         )
     if id_remap:

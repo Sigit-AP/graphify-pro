@@ -426,6 +426,27 @@ def _normalize_path(path: Path) -> Path:
     return Path(os.path.normcase(s))
 
 
+# Memoized Path.resolve(): the same root/ancestor paths are resolved repeatedly
+# across a run (once per file in file_hash), each hitting the filesystem via
+# lstat+realpath. Cache by string form — path identity is string-stable within a
+# run, and resolve() is pure given an unchanged filesystem.
+_resolve_memo: dict[str, Path] = {}
+
+
+def _memo_resolve(path: Path) -> Path:
+    key = str(path)
+    hit = _resolve_memo.get(key)
+    if hit is not None:
+        return hit
+    try:
+        hit = path.resolve()
+    except OSError:
+        # Caller handles missing paths; cache nothing and let it propagate.
+        raise
+    _resolve_memo[key] = hit
+    return hit
+
+
 def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = None) -> str:
     """SHA256 of file contents + path relative to root.
 
@@ -463,7 +484,10 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
     # path served whichever was computed first — making file_hash order-dependent
     # and poisoning the persisted stat-index across runs (#1989). Store one digest
     # per salt so alternating roots don't force re-reads.
-    resolved_root = root.resolve()
+    # PERF: root.resolve() and the walked-parents .resolve() loop below re-hit the
+    # filesystem for EVERY file (profiled: 9.9k _joinrealpath calls, ~30% of
+    # extract time). The root is constant across a run — resolve it once.
+    resolved_root = _memo_resolve(root)
     try:
         resolved_rel = resolved.relative_to(resolved_root)
     except ValueError:
@@ -484,7 +508,7 @@ def file_hash(path: Path, root: Path = Path("."), cache_root: "Path | None" = No
             walked_rel = None
             for parent in walked.parents:
                 try:
-                    if parent.resolve() == resolved_root:
+                    if _memo_resolve(parent) == resolved_root:
                         walked_rel = walked.relative_to(parent)
                         break
                 except OSError:
